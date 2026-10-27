@@ -95,6 +95,45 @@ sequenceDiagram
 
 ---
 
-## Module 2: Stateful Stream Processing (Spark) & Cloud Warehousing (Round 2 - In Progress)
+## Module 2: Stateful Stream Processing (Spark) & Cloud Warehousing (Round 2)
 
-*(Notes will be added here as soon as we finish discussing Round 2!)*
+### 2.1 Why Apache Spark Instead of a Standard Kafka Consumer Microservice?
+
+* **The Scenario:** Join **Topic A (`payments.transactions`)** and **Topic B (`payments.telemetry`)** on `payment_id`, then aggregate by `ip_address` over a **sliding 10-minute window** (`SUM(amount) > $2,000` across `COUNT(DISTINCT merchant_id) >= 3`).
+* **Your Initial Intuition (Spot-On!):**
+  1. **Cross-Node Partition Mismatch:** Records from Topic A and Topic B (or records for the same `ip_address` after joining) can land on different Kubernetes pods/nodes, so no single pod has the unified view.
+  2. **Out-of-Order / Asynchronous Arrival:** Topic A and Topic B messages arrive at different times (or out of order due to network lag), breaking naive in-memory joins and 10-minute time windows.
+
+* **How Spark Structured Streaming Solves This in Production (3 Core Concepts):**
+
+| Challenge in Plain Kafka Consumers | How Apache Spark Solves It Automatically |
+| :--- | :--- |
+| **1. Multi-Key Partitioning (Join on `payment_id`, then Group By `ip_address`)** | **Distributed Shuffle (`Exchange`):** Spark automatically redistributes data across Executor pods over the network—first co-locating Topic A & B records by `payment_id` for the join, then re-shuffling by `ip_address` for the 10-minute window aggregation. |
+| **2. Out-of-Order & Delayed Events** | **Event-Time & Watermarking (`withWatermark`):** Spark evaluates windows using **Event Time** (the timestamp inside the payload when the payment occurred) rather than **Processing Time** (when the pod read it). Setting a watermark (e.g., `2 minutes`) tells Spark how long to buffer and wait for late-arriving data before closing a window. |
+| **3. Pod Crash at Minute 9 of a 10-Minute Window** | **Distributed State Store + S3 Checkpointing:** Spark maintains window state in a fault-tolerant State Store and writes incremental checkpoints to **S3 / MinIO** every micro-batch. If a Kubernetes pod crashes, a replacement pod restores the exact window state from S3 without losing the 9-minute running totals. |
+
+```mermaid
+flowchart LR
+    subgraph Kafka["Apache Kafka (Strimzi on K8s)"]
+        TA["Topic A: payments.transactions"]
+        TB["Topic B: payments.telemetry"]
+        TC["Topic C: payments.fraud_alerts"]
+    end
+
+    subgraph Spark["Spark Structured Streaming on K8s"]
+        S1["1. Shuffle by payment_id + Event-Time Watermark Join"]
+        S2["2. Shuffle by ip_address + 10-Min Sliding Window"]
+        CP[("S3 / MinIO State Checkpoint")]
+        S1 --> S2
+        S1 <--> CP
+        S2 <--> CP
+    end
+
+    TA --> S1
+    TB --> S1
+    S2 -->|"Risk Alert"| TC
+```
+
+### 2.2 PostgreSQL (OLTP) vs. Snowflake / Delta Lake (OLAP) *(Up Next)*
+
+*(Notes will be added here after we discuss Question 2!)*
